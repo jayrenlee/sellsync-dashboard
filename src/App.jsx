@@ -303,8 +303,9 @@ function Dashboard({ session, onSignOut }) {
   };
 
   const handleScan = async (comp) => {
-    setScanning(s => ({ ...s, [comp.id]: true })); setScanResult(null);
-    try {
+  const avgOurPrice = skus.length ? skus.reduce((a,s)=>a+Number(s.price),0)/skus.length : 0;
+  setScanning(s => ({ ...s, [comp.id]: true })); setScanResult(null);
+  try {
       const res = await fetch(`${DEDE_URL}/analyze-competitor`, {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ url: comp.url })
@@ -318,6 +319,19 @@ function Dashboard({ session, onSignOut }) {
       }
       await db(`/competitors?id=eq.${comp.id}`, { method:"PATCH", body: JSON.stringify({ last_checked: new Date().toISOString() }) });
       await log(`🔍 Scanned "${comp.name}" — ${data.products.length} products found`);
+      // Auto-send WhatsApp alert if cheaper products found
+const cheaperProducts = data.products.filter(p => p.price && avgOurPrice && p.price < avgOurPrice);
+if (cheaperProducts.length > 0) {
+  const alertMsg = `🚨 SellSync Price Alert!\n\n${cheaperProducts.length} competitor product(s) found cheaper than your average price (RM${avgOurPrice.toFixed(2)}):\n\n${
+    cheaperProducts.slice(0,3).map(p => `• ${p.name?.slice(0,40)} — RM${p.price}`).join('\n')
+  }\n\nPlatform: ${comp.platform}\nCompetitor: ${comp.name}\n\n👉 Review: sellsync-dashboard-lake.vercel.app`;
+
+  await fetch(`${DEDE_URL}/send-alert`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ to: '+6587602138', message: alertMsg })
+  }).catch(e => console.error('Alert failed:', e));
+}
       setScanResult({ ...data, competitorName: comp.name });
       if (selectedComp?.id === comp.id) setCompProducts(await db(`/competitor_products?competitor_id=eq.${comp.id}&order=checked_at.desc&limit=30`));
       await loadData();
