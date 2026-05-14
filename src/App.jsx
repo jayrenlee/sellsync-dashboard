@@ -3,14 +3,7 @@ import { useState, useEffect, useCallback } from "react";
 const SUPABASE_URL = "https://ruygjqgoowqvxoqxqyzq.supabase.co";
 const SUPABASE_KEY = "sb_publishable_V5vOWaT5DRS3wCPk7VCGNA_K7pwvBvL";
 const DEDE_URL = "https://selfsync-agent-production.up.railway.app";
-
-const HEADERS = {
-  apikey: SUPABASE_KEY,
-  Authorization: `Bearer ${SUPABASE_KEY}`,
-  "Content-Type": "application/json",
-  Prefer: "return=representation",
-};
-
+const AUTH_URL = `${SUPABASE_URL}/auth/v1`;
 const API = `${SUPABASE_URL}/rest/v1`;
 
 const PLATFORMS = [
@@ -30,49 +23,215 @@ const STATUS = {
 const CATS = ["All","Electronics","Kitchen","Beauty","Furniture","Food","Fashion","Sports","Others"];
 const EMOJIS = ["📦","🎧","🖥","👗","👟","🍜","🌹","🪵","🫙","💊","🎮","📱","🏠","🚗","⌚"];
 
-async function dbFetch(path, opts = {}) {
-  const res = await fetch(`${API}${path}`, { headers: HEADERS, ...opts });
+// ── Auth helpers ─────────────────────────────────────────────
+async function signIn(email, password) {
+  const res = await fetch(`${AUTH_URL}/token?grant_type=password`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error_description || data.msg || "Login failed");
+  return data;
+}
+
+async function signUp(email, password) {
+  const res = await fetch(`${AUTH_URL}/signup`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error_description || data.msg || "Signup failed");
+  return data;
+}
+
+async function signOut(token) {
+  await fetch(`${AUTH_URL}/logout`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${token}` },
+  });
+}
+
+async function refreshToken(refresh) {
+  const res = await fetch(`${AUTH_URL}/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: refresh }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error("Session expired");
+  return data;
+}
+
+// ── DB helpers ───────────────────────────────────────────────
+function makeHeaders(token) {
+  return {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    Prefer: "return=representation",
+  };
+}
+
+async function dbFetch(path, token, opts = {}) {
+  const res = await fetch(`${API}${path}`, { headers: makeHeaders(token), ...opts });
   if (!res.ok) throw new Error(await res.text());
   const text = await res.text();
   return text ? JSON.parse(text) : [];
 }
 
-const getSkus = () => dbFetch("/skus?order=created_at.desc");
-const getActivity = () => dbFetch("/activity_log?order=created_at.desc&limit=20");
-const getCompetitors = () => dbFetch("/competitors?order=created_at.desc");
-const getCompetitorProducts = (id) => dbFetch(`/competitor_products?competitor_id=eq.${id}&order=checked_at.desc&limit=30`);
-
-async function logActivity(message) {
-  await dbFetch("/activity_log", { method: "POST", body: JSON.stringify({ message }) });
-}
-async function createSku(sku) {
-  const rows = await dbFetch("/skus", { method: "POST", body: JSON.stringify(sku) });
-  return rows[0];
-}
-async function updateSku(id, patch) {
-  const rows = await dbFetch(`/skus?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patch) });
-  return rows[0];
-}
-async function deleteSku(id) { await dbFetch(`/skus?id=eq.${id}`, { method: "DELETE" }); }
-async function addCompetitor(data) {
-  const rows = await dbFetch("/competitors", { method: "POST", body: JSON.stringify(data) });
-  return rows[0];
-}
-async function deleteCompetitor(id) { await dbFetch(`/competitors?id=eq.${id}`, { method: "DELETE" }); }
-async function saveCompetitorProducts(competitorId, products, screenshotUrl) {
-  if (!products.length) return;
-  const rows = products.map(p => ({
-    competitor_id: competitorId, product_name: p.name, price: p.price,
-    original_price: p.original_price, discount_pct: p.discount_pct,
-    rating: p.rating, sold_count: p.sold_count, screenshot_url: screenshotUrl, raw_data: p,
-  }));
-  await dbFetch("/competitor_products", { method: "POST", body: JSON.stringify(rows) });
-}
-async function updateCompetitorChecked(id) {
-  await dbFetch(`/competitors?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ last_checked: new Date().toISOString() }) });
-}
-
+// ── Main App ─────────────────────────────────────────────────
 export default function App() {
+  const [session, setSession] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const stored = localStorage.getItem("sb_session");
+    if (stored) {
+      try {
+        const s = JSON.parse(stored);
+        setSession(s);
+      } catch {}
+    }
+    setLoading(false);
+  }, []);
+
+  const handleSignIn = async (email, password) => {
+    const data = await signIn(email, password);
+    const s = { access_token: data.access_token, refresh_token: data.refresh_token, user: data.user };
+    localStorage.setItem("sb_session", JSON.stringify(s));
+    setSession(s);
+  };
+
+  const handleSignUp = async (email, password) => {
+    await signUp(email, password);
+    await handleSignIn(email, password);
+  };
+
+  const handleSignOut = async () => {
+    if (session) await signOut(session.access_token).catch(() => {});
+    localStorage.removeItem("sb_session");
+    setSession(null);
+  };
+
+  if (loading) {
+    return (
+      <div style={{ minHeight:"100vh", background:"#0B0E17", display:"flex", alignItems:"center", justifyContent:"center" }}>
+        <div style={{ color:"#4B5563", fontSize:14 }}>Loading...</div>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <AuthPage onSignIn={handleSignIn} onSignUp={handleSignUp} />;
+  }
+
+  return <Dashboard session={session} onSignOut={handleSignOut} />;
+}
+
+// ── Auth Page ────────────────────────────────────────────────
+function AuthPage({ onSignIn, onSignUp }) {
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleSubmit = async () => {
+    if (!email || !password) return setError("Please fill in all fields");
+    setLoading(true); setError("");
+    try {
+      if (mode === "login") await onSignIn(email, password);
+      else await onSignUp(email, password);
+    } catch(e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0B0E17", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"'DM Sans',system-ui,sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        .btn{cursor:pointer;border:none;border-radius:8px;font-family:inherit;font-weight:600;transition:all 0.15s}
+        .btn:hover{filter:brightness(1.1)}
+        .input{background:#1A1F2E;border:1px solid #2D3448;border-radius:8px;padding:12px 16px;color:#E2E8F0;font-family:inherit;font-size:14px;outline:none;width:100%;transition:border 0.2s}
+        .input:focus{border-color:#3B82F6}
+      `}</style>
+
+      <div style={{ width:"100%", maxWidth:420, padding:"0 24px" }}>
+        {/* Logo */}
+        <div style={{ textAlign:"center", marginBottom:40 }}>
+          <div style={{ width:56, height:56, background:"linear-gradient(135deg,#3B82F6,#8B5CF6)", borderRadius:14, display:"flex", alignItems:"center", justifyContent:"center", fontSize:28, margin:"0 auto 16px" }}>🛒</div>
+          <div style={{ fontSize:26, fontWeight:700, color:"#E2E8F0", letterSpacing:-0.5 }}>SellSync</div>
+          <div style={{ fontSize:12, color:"#4B5563", letterSpacing:2, textTransform:"uppercase", marginTop:4 }}>E-Commerce Intelligence</div>
+        </div>
+
+        {/* Card */}
+        <div style={{ background:"#141929", border:"1px solid #1E2440", borderRadius:16, padding:32 }}>
+          {/* Tabs */}
+          <div style={{ display:"flex", marginBottom:28, background:"#0D1120", borderRadius:10, padding:4 }}>
+            {["login","signup"].map(m=>(
+              <button key={m} className="btn" onClick={()=>{ setMode(m); setError(""); }}
+                style={{ flex:1, padding:"8px 0", fontSize:13, background:mode===m?"linear-gradient(135deg,#3B82F6,#8B5CF6)":"transparent", color:mode===m?"#fff":"#4B5563" }}>
+                {m==="login"?"Sign In":"Create Account"}
+              </button>
+            ))}
+          </div>
+
+          {error && (
+            <div style={{ background:"#1a0d0d", border:"1px solid #EF4444", borderRadius:8, padding:"10px 14px", color:"#EF4444", fontSize:13, marginBottom:20 }}>
+              ⚠️ {error}
+            </div>
+          )}
+
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            <div>
+              <label style={{ fontSize:11, color:"#4B5563", fontWeight:600, letterSpacing:1, textTransform:"uppercase", display:"block", marginBottom:8 }}>Email</label>
+              <input className="input" type="email" value={email} onChange={e=>setEmail(e.target.value)}
+                placeholder="seller@example.com" onKeyDown={e=>e.key==="Enter"&&handleSubmit()} />
+            </div>
+            <div>
+              <label style={{ fontSize:11, color:"#4B5563", fontWeight:600, letterSpacing:1, textTransform:"uppercase", display:"block", marginBottom:8 }}>Password</label>
+              <input className="input" type="password" value={password} onChange={e=>setPassword(e.target.value)}
+                placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&handleSubmit()} />
+            </div>
+            <button className="btn" onClick={handleSubmit} disabled={loading}
+              style={{ background:"linear-gradient(135deg,#3B82F6,#8B5CF6)", color:"#fff", padding:"14px 0", fontSize:14, marginTop:8, opacity:loading?0.7:1 }}>
+              {loading ? "⏳ Please wait..." : mode==="login" ? "Sign In →" : "Create Account →"}
+            </button>
+          </div>
+
+          {mode==="login" && (
+            <div style={{ textAlign:"center", marginTop:20, fontSize:13, color:"#4B5563" }}>
+              Don't have an account?{" "}
+              <span style={{ color:"#3B82F6", cursor:"pointer" }} onClick={()=>setMode("signup")}>Sign up free</span>
+            </div>
+          )}
+          {mode==="signup" && (
+            <div style={{ textAlign:"center", marginTop:20, fontSize:13, color:"#4B5563" }}>
+              Already have an account?{" "}
+              <span style={{ color:"#3B82F6", cursor:"pointer" }} onClick={()=>setMode("login")}>Sign in</span>
+            </div>
+          )}
+        </div>
+
+        <div style={{ textAlign:"center", marginTop:24, fontSize:11, color:"#374151" }}>
+          Powered by Dede AI · Built for Malaysian E-Commerce Sellers
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Dashboard ────────────────────────────────────────────────
+function Dashboard({ session, onSignOut }) {
+  const token = session.access_token;
+  const userId = session.user?.id;
+
   const [activeNav, setActiveNav] = useState("Dashboard");
   const [skus, setSkus] = useState([]);
   const [activity, setActivity] = useState([]);
@@ -94,13 +253,19 @@ export default function App() {
   const [loadingProducts, setLoadingProducts] = useState(false);
   const [scanResult, setScanResult] = useState(null);
 
+  const db = useCallback((path, opts) => dbFetch(path, token, opts), [token]);
+
   const loadData = useCallback(async () => {
     try {
-      const [s, a, c] = await Promise.all([getSkus(), getActivity(), getCompetitors()]);
+      const [s, a, c] = await Promise.all([
+        db("/skus?order=created_at.desc"),
+        db("/activity_log?order=created_at.desc&limit=20"),
+        db("/competitors?order=created_at.desc"),
+      ]);
       setSkus(s); setActivity(a); setCompetitors(c); setError(null);
-    } catch(e) { setError("Database connection failed."); }
+    } catch(e) { setError("Failed to load data: " + e.message); }
     finally { setLoading(false); }
-  }, []);
+  }, [db]);
 
   useEffect(() => {
     loadData();
@@ -108,9 +273,31 @@ export default function App() {
     return () => clearInterval(iv);
   }, [loadData]);
 
+  const log = async (message) => {
+    await db("/activity_log", { method:"POST", body: JSON.stringify({ message, user_id: userId }) }).catch(()=>{});
+    setActivity(a => [{ id: Date.now(), message, created_at: new Date().toISOString() }, ...a.slice(0,19)]);
+  };
+
+  // SKU operations
+  const createSku = async (sku) => {
+    const rows = await db("/skus", { method:"POST", body: JSON.stringify({ ...sku, user_id: userId }) });
+    return rows[0];
+  };
+  const updateSku = async (id, patch) => {
+    const rows = await db(`/skus?id=eq.${id}`, { method:"PATCH", body: JSON.stringify(patch) });
+    return rows[0];
+  };
+  const deleteSku = async (id) => db(`/skus?id=eq.${id}`, { method:"DELETE" });
+
+  // Competitor operations
+  const addCompetitor = async (data) => {
+    const rows = await db("/competitors", { method:"POST", body: JSON.stringify({ ...data, user_id: userId }) });
+    return rows[0];
+  };
+  const deleteCompetitor = async (id) => db(`/competitors?id=eq.${id}`, { method:"DELETE" });
   const loadCompProducts = async (comp) => {
     setSelectedComp(comp); setLoadingProducts(true); setCompProducts([]); setScanResult(null);
-    try { setCompProducts(await getCompetitorProducts(comp.id)); }
+    try { setCompProducts(await db(`/competitor_products?competitor_id=eq.${comp.id}&order=checked_at.desc&limit=30`)); }
     catch(e) { console.error(e); }
     finally { setLoadingProducts(false); }
   };
@@ -119,66 +306,34 @@ export default function App() {
     setScanning(s => ({ ...s, [comp.id]: true })); setScanResult(null);
     try {
       const res = await fetch(`${DEDE_URL}/analyze-competitor`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ url: comp.url })
       });
       const data = await res.json();
       if (!data.success) throw new Error(data.error);
-      await saveCompetitorProducts(comp.id, data.products, data.screenshotUrl);
-      await updateCompetitorChecked(comp.id);
-      await logActivity(`🔍 Scanned "${comp.name}" — ${data.products.length} products found`);
+      if (data.products.length) {
+        await db("/competitor_products", { method:"POST", body: JSON.stringify(
+          data.products.map(p => ({ competitor_id: comp.id, product_name: p.name, price: p.price, original_price: p.original_price, discount_pct: p.discount_pct, rating: p.rating, sold_count: p.sold_count, screenshot_url: data.screenshotUrl, raw_data: p }))
+        )});
+      }
+      await db(`/competitors?id=eq.${comp.id}`, { method:"PATCH", body: JSON.stringify({ last_checked: new Date().toISOString() }) });
+      await log(`🔍 Scanned "${comp.name}" — ${data.products.length} products found`);
       setScanResult({ ...data, competitorName: comp.name });
-      if (selectedComp?.id === comp.id) setCompProducts(await getCompetitorProducts(comp.id));
+      if (selectedComp?.id === comp.id) setCompProducts(await db(`/competitor_products?competitor_id=eq.${comp.id}&order=checked_at.desc&limit=30`));
       await loadData();
     } catch(e) { alert("Scan failed: " + e.message); }
     finally { setScanning(s => ({ ...s, [comp.id]: false })); }
   };
 
-  const handleAddCompetitor = async (form) => {
-    setSaving(true);
-    try {
-      await addCompetitor(form);
-      await logActivity(`➕ Competitor "${form.name}" added for monitoring`);
-      await loadData(); setShowCompModal(false);
-    } catch(e) { alert("Error: " + e.message); }
-    finally { setSaving(false); }
-  };
-
-  const handleDeleteCompetitor = async (id) => {
-    if (!confirm("Remove this competitor?")) return;
-    await deleteCompetitor(id);
-    if (selectedComp?.id === id) { setSelectedComp(null); setCompProducts([]); }
-    await loadData();
-  };
-
-  const filtered = skus.filter(s => {
-    const ms = s.name.toLowerCase().includes(search.toLowerCase()) || s.sku_code.toLowerCase().includes(search.toLowerCase());
-    const mc = catFilter === "All" || s.category === catFilter;
-    const mp = platFilter === "all" || s[`platform_${platFilter}`] !== "draft";
-    return ms && mc && mp;
-  });
-
-  const totalLive = skus.reduce((a,s) => a + ["shopee","lazada","tiktok"].filter(p => s[`platform_${p}`]==="live").length, 0);
-  const totalFailed = skus.reduce((a,s) => a + ["shopee","lazada","tiktok"].filter(p => s[`platform_${p}`]==="failed").length, 0);
-  const totalSales = skus.reduce((a,s) => a + (s.sales_shopee||0) + (s.sales_lazada||0) + (s.sales_tiktok||0), 0);
-
-  const toggleSelect = id => setSelected(s => s.includes(id)?s.filter(x=>x!==id):[...s,id]);
-  const toggleAll = () => setSelected(selected.length===filtered.length?[]:filtered.map(s=>s.id));
-
   const postSingle = async (id, platId) => {
     const field = `platform_${platId}`;
     setSkus(prev => prev.map(s => s.id!==id?s:{...s,[field]:"syncing"}));
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r,2000));
     const updated = await updateSku(id, { [field]:"live", last_sync:"Just now" });
     setSkus(prev => prev.map(s => s.id!==id?s:{...s,...updated}));
     const sku = skus.find(s=>s.id===id);
     const plat = PLATFORMS.find(p=>p.id===platId);
-    await logActivity(`✅ "${sku?.name?.split(" ").slice(0,3).join(" ")}" posted to ${plat?.label}`);
-  };
-
-  const handleDeleteSku = async id => {
-    if (!confirm("Delete this SKU?")) return;
-    await deleteSku(id); setSkus(prev=>prev.filter(s=>s.id!==id));
+    await log(`✅ "${sku?.name?.split(" ").slice(0,3).join(" ")}" posted to ${plat?.label}`);
   };
 
   const handleSaveSku = async (form) => {
@@ -187,16 +342,29 @@ export default function App() {
       if (editItem) {
         const updated = await updateSku(editItem.id, { sku_code:form.sku_code, name:form.name, category:form.category, price:form.price, stock:form.stock, image:form.image });
         setSkus(prev=>prev.map(s=>s.id===editItem.id?{...s,...updated}:s));
-        await logActivity(`✏️ Updated SKU "${form.name.split(" ").slice(0,3).join(" ")}"`);
+        await log(`✏️ Updated "${form.name.split(" ").slice(0,3).join(" ")}"`);
       } else {
         const newSku = await createSku({ sku_code:form.sku_code, name:form.name, category:form.category, price:form.price, stock:form.stock, image:form.image, platform_shopee:"draft", platform_lazada:"draft", platform_tiktok:"draft", sales_shopee:0, sales_lazada:0, sales_tiktok:0, last_sync:"Never" });
         setSkus(prev=>[newSku,...prev]);
-        await logActivity(`➕ Added SKU "${form.name.split(" ").slice(0,3).join(" ")}"`);
+        await log(`➕ Added "${form.name.split(" ").slice(0,3).join(" ")}"`);
       }
       setShowSkuModal(false);
     } catch(e) { alert("Error: "+e.message); }
     finally { setSaving(false); }
   };
+
+  const filtered = skus.filter(s => {
+    const ms = s.name.toLowerCase().includes(search.toLowerCase()) || s.sku_code.toLowerCase().includes(search.toLowerCase());
+    const mc = catFilter==="All" || s.category===catFilter;
+    const mp = platFilter==="all" || s[`platform_${platFilter}`]!=="draft";
+    return ms && mc && mp;
+  });
+
+  const totalLive = skus.reduce((a,s) => a + ["shopee","lazada","tiktok"].filter(p=>s[`platform_${p}`]==="live").length, 0);
+  const totalFailed = skus.reduce((a,s) => a + ["shopee","lazada","tiktok"].filter(p=>s[`platform_${p}`]==="failed").length, 0);
+  const totalSales = skus.reduce((a,s) => a + (s.sales_shopee||0) + (s.sales_lazada||0) + (s.sales_tiktok||0), 0);
+  const toggleSelect = id => setSelected(s=>s.includes(id)?s.filter(x=>x!==id):[...s,id]);
+  const toggleAll = () => setSelected(selected.length===filtered.length?[]:filtered.map(s=>s.id));
 
   const NAV = [
     { icon:"📊", label:"Dashboard" },
@@ -242,18 +410,20 @@ export default function App() {
           </div>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ fontSize:12, color:"#4B5563" }}>👤 {session.user?.email}</div>
           <div style={{ display:"flex", alignItems:"center", gap:6, background:"#141929", borderRadius:20, padding:"6px 12px" }}>
             <div style={{ width:6, height:6, borderRadius:"50%", background:"#10B981", boxShadow:"0 0 6px #10B981" }} className="pulse" />
-            <span style={{ fontSize:11, color:"#10B981", fontWeight:600 }}>Supabase Live</span>
+            <span style={{ fontSize:11, color:"#10B981", fontWeight:600 }}>Live</span>
           </div>
-          <button className="btn" onClick={loadData} style={{ background:"#1A1F2E", color:"#6B7280", padding:"6px 12px", fontSize:12 }}>↺ Sync</button>
+          <button className="btn" onClick={loadData} style={{ background:"#1A1F2E", color:"#6B7280", padding:"6px 12px", fontSize:12 }}>↺</button>
+          <button className="btn" onClick={onSignOut} style={{ background:"#2D1B1B", color:"#EF4444", padding:"6px 14px", fontSize:12 }}>Sign Out</button>
         </div>
       </div>
 
       <div style={{ display:"flex", height:"calc(100vh - 60px)" }}>
         {/* Sidebar */}
         <div style={{ width:220, background:"#0D1120", borderRight:"1px solid #1E2440", padding:"20px 0", display:"flex", flexDirection:"column", flexShrink:0 }}>
-          {NAV.map(item => (
+          {NAV.map(item=>(
             <div key={item.label} onClick={()=>setActiveNav(item.label)}
               style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 20px", cursor:"pointer",
                 background:activeNav===item.label?"#141929":"transparent",
@@ -261,35 +431,35 @@ export default function App() {
                 color:activeNav===item.label?"#E2E8F0":"#4B5563", fontSize:13, fontWeight:activeNav===item.label?600:400 }}>
               <span style={{ fontSize:15 }}>{item.icon}</span>
               {item.label}
-              {item.badge>0 && <span style={{ marginLeft:"auto", background:"#1E3A5F", color:"#3B82F6", borderRadius:10, padding:"1px 7px", fontSize:10, fontWeight:700 }}>{item.badge}</span>}
+              {item.badge>0&&<span style={{ marginLeft:"auto", background:"#1E3A5F", color:"#3B82F6", borderRadius:10, padding:"1px 7px", fontSize:10, fontWeight:700 }}>{item.badge}</span>}
             </div>
           ))}
           <div style={{ flex:1 }} />
           <div style={{ padding:"16px 20px", borderTop:"1px solid #1E2440" }}>
-            <div style={{ fontSize:10, color:"#4B5563", fontWeight:600, letterSpacing:1, marginBottom:6 }}>DATABASE</div>
-            <div style={{ fontSize:11, color:"#10B981" }}>✓ Supabase Connected</div>
-            <div style={{ fontSize:10, color:"#374151", marginTop:3 }}>{skus.length} SKUs · {competitors.length} Competitors</div>
+            <div style={{ fontSize:10, color:"#4B5563", fontWeight:600, letterSpacing:1, marginBottom:4 }}>ACCOUNT</div>
+            <div style={{ fontSize:11, color:"#10B981" }}>✓ Authenticated</div>
+            <div style={{ fontSize:10, color:"#374151", marginTop:2, wordBreak:"break-all" }}>{session.user?.email}</div>
           </div>
         </div>
 
         {/* Main */}
         <div style={{ flex:1, overflowY:"auto", padding:"24px 28px", display:"flex", flexDirection:"column", gap:20 }}>
-          {error && <div style={{ background:"#1a0d0d", border:"1px solid #EF4444", borderRadius:8, padding:"12px 16px", color:"#EF4444", fontSize:13 }}>⚠️ {error}</div>}
+          {error&&<div style={{ background:"#1a0d0d", border:"1px solid #EF4444", borderRadius:8, padding:"12px 16px", color:"#EF4444", fontSize:13 }}>⚠️ {error}</div>}
 
           {loading ? (
             <div style={{ display:"flex", alignItems:"center", justifyContent:"center", flex:1, flexDirection:"column", gap:16 }}>
               <span className="spin" style={{ fontSize:32 }}>⟳</span>
-              <div style={{ color:"#4B5563", fontSize:14 }}>Loading from Supabase...</div>
+              <div style={{ color:"#4B5563", fontSize:14 }}>Loading your data...</div>
             </div>
-          ) : activeNav === "Competitors" ? (
-            <CompetitorsView
-              competitors={competitors} selectedComp={selectedComp} compProducts={compProducts}
+          ) : activeNav==="Competitors" ? (
+            <CompetitorsView competitors={competitors} selectedComp={selectedComp} compProducts={compProducts}
               loadingProducts={loadingProducts} scanning={scanning} scanResult={scanResult}
-              onScan={handleScan} onSelect={loadCompProducts} onDelete={handleDeleteCompetitor}
-              onAdd={()=>setShowCompModal(true)} skus={skus}
-            />
+              onScan={handleScan} onSelect={loadCompProducts}
+              onDelete={async id=>{ if(!confirm("Remove competitor?")) return; await deleteCompetitor(id); if(selectedComp?.id===id){setSelectedComp(null);setCompProducts([]);} await loadData(); }}
+              onAdd={()=>setShowCompModal(true)} skus={skus} />
           ) : (
             <>
+              {/* Stats */}
               <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:14 }}>
                 {[
                   { label:"Total SKUs", value:skus.length, icon:"📦", color:"#3B82F6" },
@@ -310,6 +480,7 @@ export default function App() {
                 ))}
               </div>
 
+              {/* Controls */}
               <div style={{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap" }}>
                 <input className="input" placeholder="🔍  Search SKU..." value={search} onChange={e=>setSearch(e.target.value)} style={{ maxWidth:280 }} />
                 <select className="input" value={catFilter} onChange={e=>setCatFilter(e.target.value)} style={{ width:"auto" }}>{CATS.map(c=><option key={c}>{c}</option>)}</select>
@@ -328,6 +499,7 @@ export default function App() {
                 <button className="btn" onClick={()=>{ setEditItem(null); setShowSkuModal(true); }} style={{ background:"#10B981", color:"#fff", padding:"10px 20px", fontSize:13 }}>＋ Add SKU</button>
               </div>
 
+              {/* Table */}
               <div className="card" style={{ overflow:"hidden" }}>
                 <div style={{ overflowX:"auto" }}>
                   <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
@@ -379,7 +551,7 @@ export default function App() {
                             <div style={{ display:"flex", gap:6 }}>
                               <button className="btn" onClick={()=>{ setEditItem(sku); setShowSkuModal(true); }} style={{ background:"#1A1F2E", color:"#6B7280", padding:"6px 10px", fontSize:12 }}>✏️</button>
                               <button className="btn" onClick={()=>PLATFORMS.forEach(p=>postSingle(sku.id,p.id))} style={{ background:"#1E3A5F", color:"#3B82F6", padding:"6px 10px", fontSize:12 }}>🔄</button>
-                              <button className="btn" onClick={()=>handleDeleteSku(sku.id)} style={{ background:"#2D1B1B", color:"#EF4444", padding:"6px 10px", fontSize:12 }}>🗑</button>
+                              <button className="btn" onClick={async()=>{ if(!confirm("Delete?")) return; await deleteSku(sku.id); setSkus(prev=>prev.filter(s=>s.id!==sku.id)); }} style={{ background:"#2D1B1B", color:"#EF4444", padding:"6px 10px", fontSize:12 }}>🗑</button>
                             </div>
                           </td>
                         </tr>
@@ -399,7 +571,7 @@ export default function App() {
             <div style={{ fontSize:10, fontWeight:700, letterSpacing:2, color:"#4B5563", textTransform:"uppercase", marginBottom:10 }}>Live Activity</div>
             <div style={{ display:"flex", alignItems:"center", gap:6 }}>
               <div style={{ width:6, height:6, borderRadius:"50%", background:"#10B981", boxShadow:"0 0 6px #10B981" }} className="pulse" />
-              <span style={{ fontSize:11, color:"#10B981" }}>Synced from Supabase</span>
+              <span style={{ fontSize:11, color:"#10B981" }}>Your account</span>
             </div>
           </div>
           <div style={{ display:"flex", flexDirection:"column", gap:8, overflowY:"auto", flex:1 }}>
@@ -440,7 +612,7 @@ export default function App() {
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:24 }}>
               <div>
                 <div style={{ fontSize:18, fontWeight:700 }}>{editItem?"Edit SKU":"Add New SKU"}</div>
-                <div style={{ fontSize:12, color:"#4B5563", marginTop:2 }}>Saved to Supabase database</div>
+                <div style={{ fontSize:12, color:"#4B5563", marginTop:2 }}>Saved to your account</div>
               </div>
               <button className="btn" onClick={()=>setShowSkuModal(false)} style={{ background:"#1A1F2E", color:"#6B7280", padding:"6px 12px", fontSize:16 }}>✕</button>
             </div>
@@ -449,7 +621,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Add Competitor Modal */}
+      {/* Competitor Modal */}
       {showCompModal&&(
         <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100 }}
           onClick={e=>{ if(e.target===e.currentTarget) setShowCompModal(false); }}>
@@ -457,11 +629,11 @@ export default function App() {
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:24 }}>
               <div>
                 <div style={{ fontSize:18, fontWeight:700 }}>Add Competitor</div>
-                <div style={{ fontSize:12, color:"#4B5563", marginTop:2 }}>Dede will monitor and scan this store</div>
+                <div style={{ fontSize:12, color:"#4B5563", marginTop:2 }}>Dede will monitor this store for you</div>
               </div>
               <button className="btn" onClick={()=>setShowCompModal(false)} style={{ background:"#1A1F2E", color:"#6B7280", padding:"6px 12px", fontSize:16 }}>✕</button>
             </div>
-            <CompetitorForm saving={saving} onSave={handleAddCompetitor} />
+            <CompetitorForm saving={saving} onSave={async(form)=>{ setSaving(true); try{ await addCompetitor(form); await log(`➕ Competitor "${form.name}" added`); await loadData(); setShowCompModal(false); }catch(e){alert("Error: "+e.message);}finally{setSaving(false);} }} />
           </div>
         </div>
       )}
@@ -469,29 +641,27 @@ export default function App() {
   );
 }
 
+// ── Competitors View ─────────────────────────────────────────
 function CompetitorsView({ competitors, selectedComp, compProducts, loadingProducts, scanning, scanResult, onScan, onSelect, onDelete, onAdd, skus }) {
   const avgOurPrice = skus.length ? skus.reduce((a,s)=>a+Number(s.price),0)/skus.length : 0;
-
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div>
           <h2 style={{ fontSize:22, fontWeight:700, letterSpacing:-0.5 }}>🔍 Competitor Monitor</h2>
-          <p style={{ color:"#4B5563", fontSize:13, marginTop:4 }}>Dede scans competitor stores and extracts pricing intelligence automatically</p>
+          <p style={{ color:"#4B5563", fontSize:13, marginTop:4 }}>Dede scans competitor stores and extracts pricing intelligence</p>
         </div>
-        <button className="btn" onClick={onAdd} style={{ background:"linear-gradient(135deg,#3B82F6,#8B5CF6)", color:"#fff", padding:"10px 20px", fontSize:13 }}>
-          ＋ Add Competitor
-        </button>
+        <button className="btn" onClick={onAdd} style={{ background:"linear-gradient(135deg,#3B82F6,#8B5CF6)", color:"#fff", padding:"10px 20px", fontSize:13 }}>＋ Add Competitor</button>
       </div>
 
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))", gap:14 }}>
         {competitors.map(comp=>(
           <div key={comp.id} className="card" onClick={()=>onSelect(comp)}
-            style={{ padding:18, cursor:"pointer", border:selectedComp?.id===comp.id?"1px solid #3B82F6":"1px solid #1E2440", transition:"border 0.2s" }}>
+            style={{ padding:18, cursor:"pointer", border:selectedComp?.id===comp.id?"1px solid #3B82F6":"1px solid #1E2440" }}>
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
               <div>
                 <div style={{ fontSize:14, fontWeight:700, color:"#E2E8F0", marginBottom:4 }}>{comp.name}</div>
-                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <div style={{ display:"flex", gap:8 }}>
                   <span style={{ fontSize:11, background:"#1A1F2E", color:"#6B7280", borderRadius:6, padding:"2px 8px" }}>{comp.platform}</span>
                   <span style={{ fontSize:10, color:"#10B981" }}>● active</span>
                 </div>
@@ -512,7 +682,7 @@ function CompetitorsView({ competitors, selectedComp, compProducts, loadingProdu
           <div style={{ gridColumn:"1/-1", textAlign:"center", padding:"60px", color:"#374151" }}>
             <div style={{ fontSize:40, marginBottom:16 }}>🔍</div>
             <div style={{ fontSize:16, fontWeight:600, color:"#4B5563", marginBottom:8 }}>No Competitors Monitored Yet</div>
-            <div style={{ fontSize:13 }}>Click "＋ Add Competitor" to start monitoring a Shopee or Lazada store</div>
+            <div style={{ fontSize:13 }}>Click "＋ Add Competitor" to start monitoring</div>
           </div>
         )}
       </div>
@@ -521,10 +691,10 @@ function CompetitorsView({ competitors, selectedComp, compProducts, loadingProdu
         <div className="fade-in" style={{ background:"#0D2D0D", border:"1px solid #10B981", borderRadius:10, padding:"16px 20px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
           <div>
             <div style={{ color:"#10B981", fontWeight:700, fontSize:14, marginBottom:4 }}>✅ Scan Complete — {scanResult.competitorName}</div>
-            <div style={{ color:"#6B7280", fontSize:12 }}>Platform: {scanResult.platform} · {scanResult.products?.length||0} products extracted · {new Date(scanResult.scanned_at).toLocaleTimeString()}</div>
+            <div style={{ color:"#6B7280", fontSize:12 }}>{scanResult.products?.length||0} products extracted · {new Date(scanResult.scanned_at).toLocaleTimeString()}</div>
           </div>
           <a href={scanResult.screenshotUrl} target="_blank" rel="noopener noreferrer"
-            style={{ color:"#3B82F6", fontSize:12, textDecoration:"none", background:"#1E3A5F", padding:"8px 14px", borderRadius:8, whiteSpace:"nowrap" }}>
+            style={{ color:"#3B82F6", fontSize:12, textDecoration:"none", background:"#1E3A5F", padding:"8px 14px", borderRadius:8 }}>
             🖼️ View Screenshot
           </a>
         </div>
@@ -535,12 +705,12 @@ function CompetitorsView({ competitors, selectedComp, compProducts, loadingProdu
           <div style={{ padding:"16px 20px", borderBottom:"1px solid #1E2440", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
             <div>
               <div style={{ fontSize:15, fontWeight:700 }}>{selectedComp.name}</div>
-              <div style={{ fontSize:11, color:"#4B5563", marginTop:2 }}>{compProducts.length} products · Click card then "▶ Scan Now" to refresh data</div>
+              <div style={{ fontSize:11, color:"#4B5563", marginTop:2 }}>{compProducts.length} products · Click "▶ Scan Now" to refresh</div>
             </div>
-            {avgOurPrice>0&&<div style={{ fontSize:12, color:"#4B5563" }}>Our avg price: <span style={{ color:"#10B981", fontWeight:700, fontFamily:"'DM Mono',monospace" }}>RM {avgOurPrice.toFixed(2)}</span></div>}
+            {avgOurPrice>0&&<div style={{ fontSize:12, color:"#4B5563" }}>Our avg: <span style={{ color:"#10B981", fontWeight:700, fontFamily:"'DM Mono',monospace" }}>RM {avgOurPrice.toFixed(2)}</span></div>}
           </div>
           {loadingProducts?(
-            <div style={{ padding:"40px", textAlign:"center", color:"#4B5563" }}><span className="spin">⟳</span> Loading products...</div>
+            <div style={{ padding:"40px", textAlign:"center", color:"#4B5563" }}><span className="spin">⟳</span> Loading...</div>
           ):(
             <div style={{ overflowX:"auto" }}>
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
@@ -567,9 +737,7 @@ function CompetitorsView({ competitors, selectedComp, compProducts, loadingProdu
                           {p.original_price?`RM ${Number(p.original_price).toFixed(2)}`:"—"}
                         </td>
                         <td style={{ padding:"12px 14px" }}>
-                          {p.discount_pct?(
-                            <span style={{ background:"#FEF2F2", color:"#EF4444", borderRadius:6, padding:"2px 8px", fontSize:11, fontWeight:700 }}>-{p.discount_pct}%</span>
-                          ):"—"}
+                          {p.discount_pct?<span style={{ background:"#FEF2F2", color:"#EF4444", borderRadius:6, padding:"2px 8px", fontSize:11, fontWeight:700 }}>-{p.discount_pct}%</span>:"—"}
                         </td>
                         <td style={{ padding:"12px 14px", color:"#F59E0B", fontFamily:"'DM Mono',monospace", fontSize:12 }}>{p.rating||"—"}</td>
                         <td style={{ padding:"12px 14px", color:"#6B7280", fontSize:12 }}>{p.sold_count||"—"}</td>
@@ -580,15 +748,11 @@ function CompetitorsView({ competitors, selectedComp, compProducts, loadingProdu
                             </span>
                           ):"—"}
                         </td>
-                        <td style={{ padding:"12px 14px", color:"#374151", fontSize:11, whiteSpace:"nowrap" }}>
-                          {new Date(p.checked_at).toLocaleString()}
-                        </td>
+                        <td style={{ padding:"12px 14px", color:"#374151", fontSize:11, whiteSpace:"nowrap" }}>{new Date(p.checked_at).toLocaleString()}</td>
                       </tr>
                     );
                   })}
-                  {compProducts.length===0&&(
-                    <tr><td colSpan={9} style={{ padding:"40px", textAlign:"center", color:"#374151" }}>No products scanned yet. Click "▶ Scan Now" on the competitor card above.</td></tr>
-                  )}
+                  {compProducts.length===0&&<tr><td colSpan={9} style={{ padding:"30px", textAlign:"center", color:"#374151" }}>No products scanned yet. Click "▶ Scan Now" above.</td></tr>}
                 </tbody>
               </table>
             </div>
@@ -599,6 +763,7 @@ function CompetitorsView({ competitors, selectedComp, compProducts, loadingProdu
   );
 }
 
+// ── Forms ────────────────────────────────────────────────────
 function CompetitorForm({ onSave, saving }) {
   const [form, setForm] = useState({ name:"", platform:"Shopee", url:"" });
   const set = (k,v) => setForm(f=>({...f,[k]:v}));
@@ -616,8 +781,8 @@ function CompetitorForm({ onSave, saving }) {
       </div>
       <div>
         <label style={{ fontSize:11, color:"#4B5563", fontWeight:600, letterSpacing:1, textTransform:"uppercase", display:"block", marginBottom:6 }}>Store or Search URL</label>
-        <input className="input" value={form.url} onChange={e=>set("url",e.target.value)} placeholder="https://shopee.com.my/search?keyword=wireless+earbuds" />
-        <div style={{ fontSize:11, color:"#374151", marginTop:6 }}>💡 Tip: Use a category search page for best results. Dede will extract all visible products.</div>
+        <input className="input" value={form.url} onChange={e=>set("url",e.target.value)} placeholder="https://www.lazada.com.my/catalog/?q=wireless+earbuds" />
+        <div style={{ fontSize:11, color:"#374151", marginTop:6 }}>💡 Use a search or category URL for best results</div>
       </div>
       <button className="btn" onClick={()=>onSave(form)} disabled={saving||!form.name||!form.url}
         style={{ background:"linear-gradient(135deg,#3B82F6,#8B5CF6)", color:"#fff", padding:"12px 0", fontSize:14, opacity:(saving||!form.name||!form.url)?0.6:1 }}>
@@ -672,7 +837,7 @@ function SKUForm({ initial, onSave, saving }) {
       </div>
       <button className="btn" onClick={()=>onSave(form)} disabled={saving}
         style={{ background:"linear-gradient(135deg,#3B82F6,#8B5CF6)", color:"#fff", padding:"12px 0", fontSize:14, opacity:saving?0.7:1 }}>
-        {saving?"⏳ Saving to Supabase...":initial?"💾 Save Changes":"➕ Add SKU"}
+        {saving?"⏳ Saving...":initial?"💾 Save Changes":"➕ Add SKU"}
       </button>
     </div>
   );
